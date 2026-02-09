@@ -16,6 +16,7 @@ from sklearn.metrics import accuracy_score
 from sklearn.metrics import roc_auc_score
 from sklearn.calibration import calibration_curve
 from sklearn.isotonic import IsotonicRegression
+from tqdm import tqdm
 
 
 import utils
@@ -265,17 +266,23 @@ def compute_metrics(flags):
 
 
 
-    def LoadFile(fname, EMin = -1.0, nevts = -1, EMin_rescale=True):
+    def LoadFile(fname, EMin = -1.0, nevts = -1, EMin_rescale=True, offset=0):
         print("Load %s" % fname)
-        end = None if nevts < 0 else nevts
+        start = offset
+        end = None if nevts < 0 else offset + nevts
         scale_fac = 1000.
         with h5.File(fname,"r") as h5f:
-            if(hgcal): 
-                generated = h5f['showers'][:end,:,:dataset_config['MAX_CELLS']] * scale_fac
-                energies = h5f['gen_info'][:end,0] 
-            else: 
-                generated = h5f['showers'][:end] * scale_fac
-                energies = h5f['incident_energies'][:end] * scale_fac
+            if(hgcal):
+                if 'gen_info' in h5f:
+                    generated = h5f['showers'][start:end,:,:dataset_config['MAX_CELLS']] * scale_fac
+                    energies = h5f['gen_info'][start:end,0]
+                else:
+                    # Generated file: may be flat (2D) and already scaled
+                    generated = h5f['showers'][start:end]
+                    energies = h5f['incident_energies'][start:end]
+            else:
+                generated = h5f['showers'][start:end] * scale_fac
+                energies = h5f['incident_energies'][start:end] * scale_fac
 
         energies = np.reshape(energies,(-1,1))
         generated = np.reshape(generated,shape_plot)
@@ -300,13 +307,39 @@ def compute_metrics(flags):
 
     def LoadSample(fname, EMin = -1.0, nevts = -1, reprocess=False, EMin_rescale=False):
         feat_file = fname + ".feat.npz"
-        if(os.path.exists(feat_file) and not reprocess):
+        feat_file_local = os.path.join(flags.plot_folder, os.path.basename(feat_file))
+        if(not reprocess and os.path.exists(feat_file)):
             print("Load %s" % feat_file)
             feats = np.load(feat_file)['feats']
+        elif(not reprocess and os.path.exists(feat_file_local)):
+            print("Load %s" % feat_file_local)
+            feats = np.load(feat_file_local)['feats']
         else:
-            showers, energies = LoadFile(fname, EMin, flags.nevts, EMin_rescale=EMin_rescale)
-            feats = compute_feats(showers, energies, geom)
-            np.savez(feat_file, feats=feats)
+            # Check if chunked loading is needed for large flat files
+            chunk_size = 2000
+            needs_chunking = False
+            with h5.File(fname, "r") as h5f:
+                total_events = h5f['showers'].shape[0]
+                is_flat = len(h5f['showers'].shape) == 2
+                n_load = total_events if nevts < 0 else min(nevts, total_events)
+                if is_flat and n_load > chunk_size:
+                    needs_chunking = True
+
+            if needs_chunking:
+                all_feats = []
+                for start in tqdm(range(0, n_load, chunk_size), desc="Processing chunks", unit="chunk"):
+                    chunk_n = min(chunk_size, n_load - start)
+                    showers, energies = LoadFile(fname, EMin, chunk_n, EMin_rescale=EMin_rescale, offset=start)
+                    all_feats.append(compute_feats(showers, energies, geom))
+                    del showers, energies
+                feats = np.concatenate(all_feats, axis=0)
+            else:
+                showers, energies = LoadFile(fname, EMin, flags.nevts, EMin_rescale=EMin_rescale)
+                feats = compute_feats(showers, energies, geom)
+            try:
+                np.savez(feat_file, feats=feats)
+            except (PermissionError, OSError):
+                np.savez(feat_file_local, feats=feats)
 
         return feats
 
@@ -323,23 +356,28 @@ def compute_metrics(flags):
         f_sample_list = utils.get_files(flags.generated)
 
         feats_gen = feats_geant = None
-        for f_sample in f_sample_list: 
+        for f_sample in tqdm(f_sample_list, desc="Loading generated files", unit="file"):
             try:
                 feats = LoadSample( f_sample, flags.EMin, flags.nevts, reprocess=flags.reprocess, EMin_rescale=flags.EMin_rescale)
                 if(feats_gen is None): feats_gen = feats
                 else: 
                     feats_gen = np.concatenate((feats_gen, feats), axis=0)
-
+                print(feats_gen)
                 total_evts = feats_gen.shape[0]
                 if(flags.nevts > 0 and total_evts >= flags.nevts): break
-            except:
-                print("Bad file, skipping")
+            except Exception as e:
+                
+                print(f"Bad file, skipping because of {e}")
 
+        if feats_gen is None:
+            print("ERROR: No generated showers could be loaded!")
+            exit(1)
+        total_evts = feats_gen.shape[0]
         print("Loaded %i generated showers" % total_evts)
 
 
     f_geant_list = utils.get_files(dataset_config['EVAL'], folder=flags.data_folder)
-    for f_sample in f_geant_list:
+    for f_sample in tqdm(f_geant_list, desc="Loading Geant4 files", unit="file"):
         feats = LoadSample( f_sample, flags.EMin, flags.nevts)
 
         if(feats_geant is None): feats_geant = feats
